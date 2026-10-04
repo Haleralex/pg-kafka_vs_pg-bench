@@ -15,7 +15,7 @@ smoke:
 bench:
 	$(BENCH) run -repetitions 3 $(ARGS)
 
-FLEX := -profiles pg_gin_path_ops,mongo_wildcard,pg_targeted,mongo_targeted 	-read-kinds adhoc,trace,adhoc_count -rates 100,200,300
+FLEX := -profiles pg_gin_path_ops,mongo_wildcard,pg_targeted,mongo_targeted -read-kinds adhoc,trace,adhoc_count -rates 100,200,300
 
 ## flex: "index everything" profiles on queries no targeted index was built for
 flex:
