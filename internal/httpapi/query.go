@@ -3,20 +3,21 @@ package httpapi
 import (
 	"fmt"
 	"net/url"
+	"slices"
 	"strconv"
 	"time"
 
 	"github.com/Haleralex/pg-mongo-bench/internal/store"
 )
 
-// ParseReadQuery validates /read and /explain parameters.
+// ParseReadQuery validates /read, /count and /explain parameters.
 func ParseReadQuery(v url.Values) (store.ReadQuery, error) {
-	q := store.ReadQuery{Kind: store.Kind(v.Get("kind")), Service: v.Get("service"), Level: v.Get("level"), Tag: v.Get("tag"), Limit: 50}
+	q := store.ReadQuery{Kind: store.Kind(v.Get("kind")), Service: v.Get("service"), Level: v.Get("level"), Tag: v.Get("tag"), Region: v.Get("region"), TraceID: v.Get("trace_id"), Limit: 50}
 	if q.Kind == "" {
 		q.Kind = store.KindTimeline
 	}
-	if q.Kind != store.KindTimeline && q.Kind != store.KindAttributes && q.Kind != store.KindTags {
-		return q, fmt.Errorf("kind must be timeline, attributes, or tags")
+	if !slices.Contains(store.Kinds, q.Kind) {
+		return q, fmt.Errorf("kind must be one of %v", store.Kinds)
 	}
 	var err error
 	q.Tenant, err = strconv.Atoi(v.Get("tenant"))
@@ -43,6 +44,14 @@ func ParseReadQuery(v url.Values) (store.ReadQuery, error) {
 	}
 	if q.Kind == store.KindTags && q.Tag == "" {
 		return q, fmt.Errorf("tags requires tag")
+	}
+	if q.Kind == store.KindAdhoc {
+		if q.Status, err = strconv.Atoi(v.Get("status")); err != nil || q.Region == "" || q.Level == "" {
+			return q, fmt.Errorf("adhoc requires level, region and integer status")
+		}
+	}
+	if q.Kind == store.KindTrace && q.TraceID == "" {
+		return q, fmt.Errorf("trace requires trace_id")
 	}
 	return q, nil
 }

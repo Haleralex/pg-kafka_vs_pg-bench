@@ -29,6 +29,15 @@ var profiles = []Profile{
 			{Keys: bson.D{{Key: "tenant_id", Value: 1}, {Key: "payload.tags", Value: 1}, {Key: "occurred_at", Value: -1}, {Key: "_id", Value: -1}}, Options: options.Index().SetName("events_bench_tags")},
 		},
 	},
+	{
+		// The counterpart of a whole-payload GIN: one compound wildcard index
+		// (MongoDB 7.0+) with an entry per payload field path, message included.
+		// A query can use only one wildcard path; other conditions are filters.
+		Name: "mongo_wildcard",
+		Indexes: []mongo.IndexModel{
+			{Keys: bson.D{{Key: "tenant_id", Value: 1}, {Key: "payload.$**", Value: 1}}, Options: options.Index().SetName("events_bench_payload")},
+		},
+	},
 }
 
 func Lookup(name string) (Profile, bool) {
@@ -104,6 +113,10 @@ func filter(q store.ReadQuery) bson.D {
 		f = append(f, bson.E{Key: "payload.service", Value: q.Service}, bson.E{Key: "payload.level", Value: q.Level})
 	case store.KindTags:
 		f = append(f, bson.E{Key: "payload.tags", Value: q.Tag})
+	case store.KindAdhoc:
+		f = append(f, bson.E{Key: "payload.level", Value: q.Level}, bson.E{Key: "payload.attrs.region", Value: q.Region}, bson.E{Key: "payload.attrs.status", Value: q.Status})
+	case store.KindTrace:
+		f = append(f, bson.E{Key: "payload.attrs.trace_id", Value: q.TraceID})
 	}
 	return f
 }
@@ -138,9 +151,37 @@ func extJSON(result *mongo.SingleResult) (json.RawMessage, error) {
 	return json.RawMessage(data), err
 }
 
-func (s *Store) Explain(ctx context.Context, q store.ReadQuery) (any, error) {
-	find := bson.D{{Key: "find", Value: s.collection.Name()}, {Key: "filter", Value: filter(q)}, {Key: "sort", Value: newestFirst}, {Key: "limit", Value: q.Limit}}
-	return extJSON(s.database.RunCommand(ctx, bson.D{{Key: "explain", Value: find}, {Key: "verbosity", Value: "executionStats"}}))
+// countPipeline is what CountDocuments sends; Explain uses it to show the same plan.
+func countPipeline(q store.ReadQuery) mongo.Pipeline {
+	return mongo.Pipeline{
+		{{Key: "$match", Value: filter(q)}},
+		{{Key: "$group", Value: bson.D{{Key: "_id", Value: 1}, {Key: "n", Value: bson.D{{Key: "$sum", Value: 1}}}}}},
+	}
+}
+
+func (s *Store) Count(ctx context.Context, q store.ReadQuery) (int64, time.Duration, error) {
+	pipeline := countPipeline(q)
+	start := time.Now()
+	cursor, err := s.collection.Aggregate(ctx, pipeline)
+	if err != nil {
+		return 0, time.Since(start), err
+	}
+	var result []struct {
+		N int64 `bson:"n"`
+	}
+	err = cursor.All(ctx, &result)
+	if err != nil || len(result) == 0 {
+		return 0, time.Since(start), err
+	}
+	return result[0].N, time.Since(start), nil
+}
+
+func (s *Store) Explain(ctx context.Context, q store.ReadQuery, count bool) (any, error) {
+	command := bson.D{{Key: "find", Value: s.collection.Name()}, {Key: "filter", Value: filter(q)}, {Key: "sort", Value: newestFirst}, {Key: "limit", Value: q.Limit}}
+	if count {
+		command = bson.D{{Key: "aggregate", Value: s.collection.Name()}, {Key: "pipeline", Value: countPipeline(q)}, {Key: "cursor", Value: bson.D{}}}
+	}
+	return extJSON(s.database.RunCommand(ctx, bson.D{{Key: "explain", Value: command}, {Key: "verbosity", Value: "executionStats"}}))
 }
 
 func (s *Store) Maintain(ctx context.Context) (any, error) {

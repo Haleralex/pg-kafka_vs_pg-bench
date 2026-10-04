@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -19,11 +20,26 @@ func TestParseRunFlags(t *testing.T) {
 		{"-step", "30"},
 		{"-seed", "10"},
 		{"-write-percent", "101"},
+		{"-read-kinds", "timeline,fulltext"},
 		{"extra"},
 	} {
 		if _, err := parseRunFlags(args); err == nil {
 			t.Errorf("accepted %v", args)
 		}
+	}
+}
+
+func TestReadKindsMatchK6(t *testing.T) {
+	script, err := os.ReadFile("../../k6/load.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	quoted := make([]string, 0)
+	for _, kind := range readKinds() {
+		quoted = append(quoted, "'"+kind+"'")
+	}
+	if want := "const ALL_READ_KINDS = [" + strings.Join(quoted, ", ") + "];"; !strings.Contains(string(script), want) {
+		t.Fatalf("k6/load.js must declare %s", want)
 	}
 }
 

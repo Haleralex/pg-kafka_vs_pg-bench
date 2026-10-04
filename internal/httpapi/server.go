@@ -9,6 +9,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"strconv"
 	"sync"
 	"time"
 
@@ -33,11 +34,13 @@ func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /health", s.health)
 	mux.HandleFunc("GET /read", s.read)
+	mux.HandleFunc("GET /count", s.count)
 	mux.HandleFunc("POST /write", s.write)
 	mux.HandleFunc("GET /stats", s.stats)
 	mux.HandleFunc("GET /explain", s.explain)
 	mux.HandleFunc("POST /admin/seed", s.seed)
 	mux.HandleFunc("POST /admin/maintain", s.maintain)
+	mux.HandleFunc("GET /admin/traces", s.traces)
 	return mux
 }
 
@@ -99,6 +102,47 @@ func (s *Server) read(w http.ResponseWriter, r *http.Request) {
 	respond(w, http.StatusOK, map[string]any{"events": events, "count": len(events), "db_ms": millis(duration)})
 }
 
+func (s *Server) count(w http.ResponseWriter, r *http.Request) {
+	query, err := ParseReadQuery(r.URL.Query())
+	if err != nil {
+		fail(w, http.StatusBadRequest, err)
+		return
+	}
+	s.gate.RLock()
+	defer s.gate.RUnlock()
+	ctx, cancel := context.WithTimeout(r.Context(), s.requestTimeout)
+	defer cancel()
+	n, duration, err := s.store.Count(ctx, query)
+	if err != nil {
+		fail(w, http.StatusInternalServerError, err)
+		return
+	}
+	respond(w, http.StatusOK, map[string]any{"count": n, "db_ms": millis(duration)})
+}
+
+// traces lists tenant/trace_id pairs of seeded events for trace lookups. They
+// come from the deterministic generator, so no database work is involved.
+func (s *Server) traces(w http.ResponseWriter, r *http.Request) {
+	seed, err1 := strconv.Atoi(r.URL.Query().Get("seed_count"))
+	n, err2 := strconv.Atoi(r.URL.Query().Get("count"))
+	if err1 != nil || err2 != nil || seed < 1 || n < 1 || n > 10000 {
+		fail(w, http.StatusBadRequest, fmt.Errorf("seed_count must be positive and count must be 1..10000"))
+		return
+	}
+	type trace struct {
+		ID      int64  `json:"id"`
+		Tenant  int    `json:"tenant"`
+		TraceID string `json:"trace_id"`
+	}
+	result := make([]trace, n)
+	for i := range result {
+		// Spread samples evenly over the seeded range.
+		e := event.Generate(1 + int64(i)*int64(seed)/int64(n))
+		result[i] = trace{ID: e.ID, Tenant: e.TenantID, TraceID: e.Payload.Attrs.TraceID}
+	}
+	respond(w, http.StatusOK, result)
+}
+
 func (s *Server) write(w http.ResponseWriter, r *http.Request) {
 	var body struct {
 		StartID int64 `json:"start_id"`
@@ -136,7 +180,7 @@ func (s *Server) explain(w http.ResponseWriter, r *http.Request) {
 	defer s.gate.RUnlock()
 	ctx, cancel := context.WithTimeout(r.Context(), s.requestTimeout)
 	defer cancel()
-	plan, err := s.store.Explain(ctx, query)
+	plan, err := s.store.Explain(ctx, query, r.URL.Query().Get("mode") == "count")
 	if err != nil {
 		fail(w, http.StatusInternalServerError, err)
 		return

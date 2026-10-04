@@ -35,6 +35,7 @@ type runConfig struct {
 	transition   string
 	writePercent int
 	batchSize    int
+	readKinds    string
 	port         int
 	repetitions  int
 	skipBuild    bool
@@ -47,6 +48,25 @@ var (
 	ratesPattern    = regexp.MustCompile(`^[1-9]\d*(,[1-9]\d*)*$`)
 	durationPattern = regexp.MustCompile(`^(\d+(\.\d+)?(ms|s|m|h))+$`)
 )
+
+// readKinds are the read operations k6/load.js can issue: every store.Kind via
+// /read, plus adhoc_count, which sends the adhoc filter to /count.
+func readKinds() []string {
+	kinds := make([]string, 0, len(store.Kinds)+1)
+	for _, kind := range store.Kinds {
+		kinds = append(kinds, string(kind))
+	}
+	return append(kinds, "adhoc_count")
+}
+
+func validReadKinds(list string) bool {
+	for _, kind := range strings.Split(list, ",") {
+		if !slices.Contains(readKinds(), kind) {
+			return false
+		}
+	}
+	return true
+}
 
 func knownProfiles() []string { return append(postgres.Names(), mongodb.Names()...) }
 
@@ -73,6 +93,7 @@ func parseRunFlags(args []string) (runConfig, error) {
 	fs.StringVar(&cfg.transition, "transition", "10s", "ramp duration between different rates")
 	fs.IntVar(&cfg.writePercent, "write-percent", 70, "share of write requests, 0..100")
 	fs.IntVar(&cfg.batchSize, "batch", 10, "events per write request, 1..1000")
+	fs.StringVar(&cfg.readKinds, "read-kinds", "timeline,attributes,tags", "comma-separated read mix: "+strings.Join(readKinds(), ", "))
 	fs.IntVar(&cfg.port, "port", 18088, "host port published for the API")
 	fs.IntVar(&cfg.repetitions, "repetitions", 1, "full passes over the profiles; even passes run in reverse order")
 	fs.BoolVar(&cfg.skipBuild, "skip-build", false, "reuse the existing API image")
@@ -102,6 +123,8 @@ func parseRunFlags(args []string) (runConfig, error) {
 		return cfg, fmt.Errorf("-write-percent must be 0..100")
 	case cfg.batchSize < 1 || cfg.batchSize > 1000:
 		return cfg, fmt.Errorf("-batch must be 1..1000")
+	case !validReadKinds(cfg.readKinds):
+		return cfg, fmt.Errorf("-read-kinds must be a comma-separated subset of %s", strings.Join(readKinds(), ","))
 	case cfg.port < 1 || cfg.port > 65535:
 		return cfg, fmt.Errorf("-port must be 1..65535")
 	case cfg.repetitions < 1 || cfg.repetitions > 10:
@@ -292,32 +315,43 @@ func (r *runner) checkQueries(ctx context.Context, id string) error {
 	base := event.BaseTime.UnixMilli()
 	signatures := map[string][]int64{}
 	plans := map[string]json.RawMessage{}
-	for _, kind := range []store.Kind{store.KindTimeline, store.KindAttributes, store.KindTags} {
-		for _, tenant := range []int{1, 17, 51} {
+	for _, kind := range store.Kinds {
+		for i, tenant := range []int{1, 17, 51} {
 			query := url.Values{
 				"kind": {string(kind)}, "tenant": {strconv.Itoa(tenant)},
 				"from_ms": {strconv.FormatInt(base, 10)}, "to_ms": {strconv.FormatInt(base+int64(r.cfg.seedCount)+1, 10)},
-				"service": {"svc-00"}, "level": {"error"}, "tag": {"tag-00"}, "limit": {"50"},
-			}.Encode()
-			data, err := r.request(ctx, http.MethodGet, "/read?"+query, nil, time.Minute)
+				"service": {"svc-00"}, "level": {"error"}, "tag": {"tag-00"}, "region": {"eu-west"}, "status": {"503"}, "limit": {"50"},
+			}
+			if kind == store.KindTrace {
+				// Seeded events spread over the range; each lookup must find exactly one.
+				e := event.Generate(int64(r.cfg.seedCount) * int64(i+1) / 4)
+				query.Set("tenant", strconv.Itoa(e.TenantID))
+				query.Set("trace_id", e.Payload.Attrs.TraceID)
+			}
+			encoded := query.Encode()
+			ids, err := r.readIDs(ctx, encoded)
 			if err != nil {
 				return err
 			}
-			var result struct {
-				Events []struct {
-					ID int64 `json:"id"`
-				} `json:"events"`
+			if kind == store.KindTrace && len(ids) != 1 {
+				return fmt.Errorf("%s: trace lookup %s found %d events, want 1", id, encoded, len(ids))
 			}
-			if err := json.Unmarshal(data, &result); err != nil {
-				return fmt.Errorf("decode /read: %w", err)
+			signatures[fmt.Sprintf("%s-%d", kind, i)] = ids
+			if kind == store.KindAdhoc {
+				n, err := r.countEvents(ctx, encoded)
+				if err != nil {
+					return err
+				}
+				signatures[fmt.Sprintf("adhoc_count-%d", i)] = []int64{n}
 			}
-			ids := make([]int64, len(result.Events))
-			for i, e := range result.Events {
-				ids[i] = e.ID
+			if i > 0 {
+				continue
 			}
-			signatures[fmt.Sprintf("%s-%d", kind, tenant)] = ids
-			if tenant == 1 {
-				if plans[string(kind)], err = r.request(ctx, http.MethodGet, "/explain?"+query, nil, time.Minute); err != nil {
+			if plans[string(kind)], err = r.request(ctx, http.MethodGet, "/explain?"+encoded, nil, time.Minute); err != nil {
+				return err
+			}
+			if kind == store.KindAdhoc {
+				if plans["adhoc_count"], err = r.request(ctx, http.MethodGet, "/explain?mode=count&"+encoded, nil, time.Minute); err != nil {
 					return err
 				}
 			}
@@ -341,6 +375,40 @@ func (r *runner) checkQueries(ctx context.Context, id string) error {
 	return nil
 }
 
+func (r *runner) readIDs(ctx context.Context, query string) ([]int64, error) {
+	data, err := r.request(ctx, http.MethodGet, "/read?"+query, nil, time.Minute)
+	if err != nil {
+		return nil, err
+	}
+	var result struct {
+		Events []struct {
+			ID int64 `json:"id"`
+		} `json:"events"`
+	}
+	if err := json.Unmarshal(data, &result); err != nil {
+		return nil, fmt.Errorf("decode /read: %w", err)
+	}
+	ids := make([]int64, len(result.Events))
+	for i, e := range result.Events {
+		ids[i] = e.ID
+	}
+	return ids, nil
+}
+
+func (r *runner) countEvents(ctx context.Context, query string) (int64, error) {
+	data, err := r.request(ctx, http.MethodGet, "/count?"+query, nil, time.Minute)
+	if err != nil {
+		return 0, err
+	}
+	var result struct {
+		Count int64 `json:"count"`
+	}
+	if err := json.Unmarshal(data, &result); err != nil {
+		return 0, fmt.Errorf("decode /count: %w", err)
+	}
+	return result.Count, nil
+}
+
 func (r *runner) runLoad(ctx context.Context, id string, env []string) (int, error) {
 	stdout, err := os.Create(r.path(id + "-k6.log"))
 	if err != nil {
@@ -358,6 +426,7 @@ func (r *runner) runLoad(ctx context.Context, id string, env []string) (int, err
 		"RUN_ID": id, "SEED_COUNT": strconv.Itoa(r.cfg.seedCount), "RATE_STEPS": r.cfg.rates,
 		"WARMUP_DURATION": r.cfg.warmup, "STEP_DURATION": r.cfg.step, "TRANSITION_DURATION": r.cfg.transition,
 		"WRITE_PERCENT": strconv.Itoa(r.cfg.writePercent), "BATCH_SIZE": strconv.Itoa(r.cfg.batchSize),
+		"READ_KINDS": r.cfg.readKinds,
 	}
 	// -T: no TTY, so k6 neither waits on stdin nor fills the log with progress bars.
 	args := []string{"--profile", "load", "run", "--rm", "--no-deps", "-T", "--name", container}

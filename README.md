@@ -38,6 +38,30 @@ to inspect the final profile interactively. Each seed recreates only
 `docbench.events_bench` in this dedicated Compose project. Results have
 timestamped names and are retained.
 
+## Flexible queries
+
+The default experiment favors B-trees: every read sorts by time with `LIMIT`,
+and GIN cannot return rows in order. `make flex` asks the opposite question —
+queries on fields nobody indexed for — and compares "index everything" with
+"index everything":
+
+| Profile | Index | Strength | Weakness |
+| --- | --- | --- | --- |
+| `pg_gin_path_ops` | GIN over the whole payload | intersects several conditions (BitmapAnd) | no order: matches are collected, then sorted |
+| `mongo_wildcard` | compound wildcard `{tenant_id, payload.$**}` | ordered B-tree entry per field path | one wildcard path per query; other conditions filter fetched documents |
+| `pg_targeted`, `mongo_targeted` | indexes for the known queries only | control: what an unplanned query costs | — |
+
+| Read kind | Filter | Matches per tenant (200k seed) |
+| --- | --- | --- |
+| `adhoc` | `level` + `attrs.region` + `attrs.status`, newest 50 | ~5 (1/360) |
+| `trace` | `attrs.trace_id` over the whole seeded range | exactly 1 |
+| `adhoc_count` | the `adhoc` filter as a count, no ORDER BY/LIMIT | ~5 |
+
+The wildcard index also stores every message string as a key, while
+`jsonb_path_ops` stores hashes; compare `index_bytes` in `*-before.json`.
+Use `make flex ARGS="-write-percent 0 -skip-build"` for read cost alone and
+`-write-percent 100` for the cost of indexing everything.
+
 ## Layout
 
 | Path | Responsibility |

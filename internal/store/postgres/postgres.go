@@ -78,22 +78,26 @@ func (s *Store) Write(ctx context.Context, events []event.Event) (time.Duration,
 	return time.Since(start), err
 }
 
-func (s *Store) query(q store.ReadQuery) (string, []any) {
-	sql := `SELECT id, tenant_id, occurred_at, payload FROM events_bench WHERE tenant_id=$1 AND occurred_at >= $2 AND occurred_at < $3`
+func (s *Store) where(q store.ReadQuery) (string, []any) {
+	where := `WHERE tenant_id=$1 AND occurred_at >= $2 AND occurred_at < $3`
 	args := []any{q.Tenant, q.From, q.To}
-	var condition string
-	switch q.Kind {
-	case store.KindAttributes:
-		condition, args = s.profile.Attributes(q, args)
-	case store.KindTags:
-		condition, args = s.profile.Tags(q, args)
+	if predicate, ok := s.profile.Predicates[q.Kind]; ok {
+		var condition string
+		condition, args = predicate(q, args)
+		where += " AND " + condition
 	}
-	if condition != "" {
-		sql += " AND " + condition
-	}
+	return where, args
+}
+
+func (s *Store) query(q store.ReadQuery) (string, []any) {
+	where, args := s.where(q)
 	args = append(args, q.Limit)
-	sql += ` ORDER BY occurred_at DESC, id DESC LIMIT ` + placeholder(args)
-	return sql, args
+	return `SELECT id, tenant_id, occurred_at, payload FROM events_bench ` + where + ` ORDER BY occurred_at DESC, id DESC LIMIT ` + placeholder(args), args
+}
+
+func (s *Store) countQuery(q store.ReadQuery) (string, []any) {
+	where, args := s.where(q)
+	return `SELECT count(*) FROM events_bench ` + where, args
 }
 
 func (s *Store) Read(ctx context.Context, q store.ReadQuery) ([]event.Event, time.Duration, error) {
@@ -120,8 +124,19 @@ func (s *Store) Read(ctx context.Context, q store.ReadQuery) ([]event.Event, tim
 	return events, time.Since(start), rows.Err()
 }
 
-func (s *Store) Explain(ctx context.Context, q store.ReadQuery) (any, error) {
+func (s *Store) Count(ctx context.Context, q store.ReadQuery) (int64, time.Duration, error) {
+	sql, args := s.countQuery(q)
+	start := time.Now()
+	var count int64
+	err := s.pool.QueryRow(ctx, sql, args...).Scan(&count)
+	return count, time.Since(start), err
+}
+
+func (s *Store) Explain(ctx context.Context, q store.ReadQuery, count bool) (any, error) {
 	sql, args := s.query(q)
+	if count {
+		sql, args = s.countQuery(q)
+	}
 	var plan json.RawMessage
 	err := s.pool.QueryRow(ctx, `EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) `+sql, args...).Scan(&plan)
 	return plan, err

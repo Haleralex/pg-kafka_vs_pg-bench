@@ -15,7 +15,7 @@ import (
 	"text/tabwriter"
 )
 
-var operations = []string{"write", "timeline", "attributes", "tags"}
+var operations = append([]string{"write"}, readKinds()...)
 
 // runIDPattern splits IDs created by runProfile: <stamp>-r<repetition>-<profile>.
 var runIDPattern = regexp.MustCompile(`^.+-r(\d+)-(.+)$`)
