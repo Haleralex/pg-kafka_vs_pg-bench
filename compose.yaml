@@ -1,0 +1,64 @@
+name: gotraining-docbench
+
+services:
+  postgres:
+    image: postgres:17
+    environment:
+      POSTGRES_USER: docbench
+      POSTGRES_PASSWORD: docbench-local
+      POSTGRES_DB: docbench
+    command: [postgres, -c, shared_buffers=512MB, -c, max_connections=100, -c, track_io_timing=on]
+    cpus: 2
+    mem_limit: 2g
+    shm_size: 768m
+    volumes:
+      - pg-data:/var/lib/postgresql/data
+    healthcheck:
+      test: [CMD-SHELL, pg_isready -U docbench -d docbench]
+      interval: 2s
+      timeout: 5s
+      retries: 40
+
+  mongo:
+    image: mongo:8.0
+    command: [mongod, --wiredTigerCacheSizeGB, "0.5", --bind_ip_all]
+    cpus: 2
+    mem_limit: 2g
+    volumes:
+      - mongo-data:/data/db
+    healthcheck:
+      test: [CMD, mongosh, --quiet, --eval, "quit(db.adminCommand({ping: 1}).ok ? 0 : 1)"]
+      interval: 3s
+      timeout: 10s
+      retries: 40
+
+  api:
+    build: ./backend
+    image: gotraining/docbench-api:local
+    environment:
+      BENCH_PROFILE: ${BENCH_PROFILE:-pg_gin_path_ops}
+      PG_URL: postgres://docbench:docbench-local@postgres:5432/docbench?sslmode=disable
+      MONGO_URL: mongodb://mongo:27017/docbench
+      GOMAXPROCS: "2"
+    ports:
+      - "127.0.0.1:${BENCH_PORT:-18088}:8080"
+    cpus: 2
+    mem_limit: 768m
+
+  k6:
+    image: grafana/k6:1.3.0
+    profiles: [load]
+    user: "0:0"
+    cpus: 2
+    mem_limit: 1g
+    environment:
+      BASE_URL: http://api:8080
+      K6_NO_USAGE_REPORT: "true"
+    volumes:
+      - ./k6:/scripts:ro
+      - ./results:/results
+    entrypoint: [k6, run, /scripts/load.js]
+
+volumes:
+  pg-data:
+  mongo-data:
