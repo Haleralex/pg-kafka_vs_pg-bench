@@ -50,7 +50,7 @@ const report = `{
     "operations{phase:warmup,op:write}": {"values": {"count": 999}},
     "operations{phase:step_1_10,op:write}": {"values": {"count": 35}},
     "http_req_duration{phase:step_1_10,op:write}": {"values": {"p(95)": %g, "p(99)": 3}},
-    "write_documents{phase:step_1_10,op:write}": {"values": {"count": 350}},
+    "write_documents{phase:step_1_10}": {"values": {"count": 350}},
     "operations{phase:step_1_10,op:tags}": {"values": {"count": 5}},
     "empty_read_rate{phase:step_1_10,op:tags}": {"values": {"rate": 0.2}}
   }

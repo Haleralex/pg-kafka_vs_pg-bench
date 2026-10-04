@@ -90,7 +90,8 @@ func loadRows(dir, prefix string) ([]row, error) {
 				r.DBP95, _ = report.metric("db_ms"+filter, "p(95)")
 				r.ErrorRate, _ = report.metric("request_errors"+filter, "rate")
 				if op == "write" {
-					documents, _ := report.metric("write_documents"+filter, "count")
+					// k6/load.js counts documents per phase only, not per operation.
+					documents, _ := report.metric(fmt.Sprintf("write_documents{phase:%s}", phase.Name), "count")
 					r.DocumentsPerS = documents / seconds
 				} else {
 					r.EmptyReadRate, _ = report.metric("empty_read_rate"+filter, "rate")
