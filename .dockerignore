@@ -2,6 +2,5 @@
 .github
 .devcontainer
 results
-k6
 *.exe
 *.test

@@ -1,5 +1,5 @@
 {
-  "name": "pg-mongo-bench",
+  "name": "pg-skiplocked-vs-kafka",
   "image": "mcr.microsoft.com/devcontainers/base:ubuntu-24.04",
   "features": {
     "ghcr.io/devcontainers/features/docker-in-docker:2": {},

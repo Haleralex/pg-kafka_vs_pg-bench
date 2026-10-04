@@ -13,11 +13,11 @@ import (
 )
 
 // composeProject must match the name in compose.yaml; resource sampling filters on it.
-const composeProject = "gotraining-docbench"
+const composeProject = "gotraining-queuebench"
 
 type compose struct {
 	file string
-	env  []string // BENCH_PORT and other variables substituted into compose.yaml
+	env  []string // variables substituted into compose.yaml
 }
 
 func (c compose) command(ctx context.Context, extraEnv []string, args ...string) *exec.Cmd {

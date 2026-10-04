@@ -1,7 +1,7 @@
-// Command bench runs the k6 experiment against every profile and summarizes the results.
+// Command bench runs the queue experiment against every profile and summarizes the results.
 //
-//	bench run [flags]        seed, validate and load each profile in Docker Compose
-//	bench summarize [flags]  combine k6 summaries into a CSV and a median table
+//	bench run [flags]        start each broker in Docker Compose and run cmd/loadgen against it
+//	bench summarize [flags]  combine loadgen reports into a CSV and median tables
 package main
 
 import (

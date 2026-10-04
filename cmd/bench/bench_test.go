@@ -1,26 +1,34 @@
 package main
 
 import (
-	"fmt"
+	"bytes"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/Haleralex/pg-mongo-bench/internal/loadgen"
+	"github.com/Haleralex/pg-mongo-bench/internal/profile"
 )
 
 func TestParseRunFlags(t *testing.T) {
 	cfg, err := parseRunFlags(nil)
-	if err != nil || len(cfg.profiles) != 3 || cfg.seedCount != 200000 {
+	if err != nil || len(cfg.profiles) != len(profile.All) || cfg.workload.Backlog != loadgen.Defaults().Backlog {
 		t.Fatalf("defaults rejected: %+v %v", cfg, err)
 	}
+	cfg, err = parseRunFlags([]string{"-profiles", "pg_sync,kafka", "-rates", "100,200", "-consumers", "8"})
+	if err != nil || len(cfg.profiles) != 2 || cfg.workload.Consumers != 8 || len(cfg.workload.Rates) != 2 {
+		t.Fatalf("flags ignored: %+v %v", cfg, err)
+	}
 	for _, args := range [][]string{
-		{"-profiles", "pg_gin_path_ops,mysql"},
+		{"-profiles", "pg_sync,rabbitmq"},
 		{"-rates", "100,,300"},
 		{"-rates", "0"},
 		{"-step", "30"},
-		{"-seed", "10"},
-		{"-write-percent", "101"},
-		{"-read-kinds", "timeline,fulltext"},
+		{"-backlog", "10"},
+		{"-batch", "0"},
+		{"-kafka-linger", "-1ms"},
 		{"extra"},
 	} {
 		if _, err := parseRunFlags(args); err == nil {
@@ -29,78 +37,75 @@ func TestParseRunFlags(t *testing.T) {
 	}
 }
 
-func TestReadKindsMatchK6(t *testing.T) {
-	script, err := os.ReadFile("../../k6/load.js")
+func TestEveryProfileHasAComposeService(t *testing.T) {
+	compose, err := os.ReadFile("../../compose.yaml")
 	if err != nil {
 		t.Fatal(err)
 	}
-	quoted := make([]string, 0)
-	for _, kind := range readKinds() {
-		quoted = append(quoted, "'"+kind+"'")
-	}
-	if want := "const ALL_READ_KINDS = [" + strings.Join(quoted, ", ") + "];"; !strings.Contains(string(script), want) {
-		t.Fatalf("k6/load.js must declare %s", want)
-	}
-}
-
-func TestEveryProfileHasADatabase(t *testing.T) {
-	seen := map[string]bool{}
-	for _, p := range knownProfiles() {
-		if seen[p] {
-			t.Fatalf("profile %s is registered twice", p)
-		}
-		seen[p] = true
-		if _, ok := databaseService(p); !ok {
-			t.Fatalf("profile %s has no compose service", p)
+	for _, p := range profile.All {
+		if !strings.Contains(string(compose), "\n  "+p.Service+":\n") {
+			t.Fatalf("profile %s needs service %s in compose.yaml", p.Name, p.Service)
 		}
 	}
 }
 
-const report = `{
-  "config": {"run_id": "20261004-094116-r%d-%s", "phases": [
-    {"name": "warmup", "kind": "warmup", "target": 100, "duration_ms": 2000},
-    {"name": "step_1_10", "kind": "measurement", "target": 10, "duration_ms": 5000}
-  ]},
-  "metrics": {
-    "dropped_iterations": {"values": {"count": 0}},
-    "operations{phase:warmup,op:write}": {"values": {"count": 999}},
-    "operations{phase:step_1_10,op:write}": {"values": {"count": 35}},
-    "http_req_duration{phase:step_1_10,op:write}": {"values": {"p(95)": %g, "p(99)": 3}},
-    "write_documents{phase:step_1_10}": {"values": {"count": 350}},
-    "operations{phase:step_1_10,op:tags}": {"values": {"count": 5}},
-    "empty_read_rate{phase:step_1_10,op:tags}": {"values": {"rate": 0.2}}
-  }
-}`
-
-func TestSummarizeMeasuredPhasesOnly(t *testing.T) {
-	dir := t.TempDir()
-	for i, p95 := range []float64{2, 10, 4} {
-		name := filepath.Join(dir, fmt.Sprintf("r%d.json", i+1))
-		if err := os.WriteFile(name, []byte(fmt.Sprintf(report, i+1, "pg_targeted", p95)), 0o644); err != nil {
-			t.Fatal(err)
-		}
+func writeReport(t *testing.T, dir, runID, name string, fill, p99 float64, drained bool, stats map[string]any) {
+	t.Helper()
+	res := loadgen.Result{
+		Fill: loadgen.Throughput{PerSecond: fill}, Drain: loadgen.Throughput{PerSecond: fill * 2},
+		Steps: []loadgen.Step{
+			{TargetRate: 1000, ConsumedRate: 1000, EndToEnd: loadgen.Latency{P50: 1, P99: p99}, Drained: true},
+			{TargetRate: 5000, ConsumedRate: 4000, EndToEnd: loadgen.Latency{P99: p99 * 10}, BacklogAtEnd: 9000, Drained: drained},
+		},
+		Produced: 1000,
 	}
-	if err := os.WriteFile(filepath.Join(dir, "runs.json"), []byte(`[{"id": "x"}]`), 0o644); err != nil {
+	data, err := json.Marshal(map[string]any{"run_id": runID, "profile": name, "result": res, "backend_stats": stats})
+	if err != nil {
 		t.Fatal(err)
 	}
-	rows, err := loadRows(dir, "")
-	if err != nil || len(rows) != 6 {
-		t.Fatalf("rows=%d err=%v", len(rows), err)
+	if err := os.WriteFile(filepath.Join(dir, runID+"-report.json"), data, 0o644); err != nil {
+		t.Fatal(err)
 	}
-	summaries := summarize(rows)
-	if len(summaries) != 2 {
-		t.Fatalf("summaries=%+v", summaries)
+}
+
+func TestSummarizeTakesMediansPerProfileAndRate(t *testing.T) {
+	dir := t.TempDir()
+	for i, fill := range []float64{100, 500, 300} {
+		run := "20261004-120000-r" + string(rune('1'+i)) + "-pg_sync"
+		writeReport(t, dir, run, "pg_sync", fill, fill/100, i != 1, map[string]any{"wal_bytes": 400000})
 	}
-	write, tags := summaries[0], summaries[1]
-	if write.Operation != "write" || write.Profile != "pg_targeted" || write.Runs != 3 || write.HTTPP95 != 4 || write.CompletedRPS != 7 || write.DocumentsPerS != 70 {
-		t.Fatalf("write summary: %+v", write)
+	writeReport(t, dir, "20261004-120000-r1-kafka", "kafka", 9000, 0.5, true, map[string]any{"log_bytes": 300000})
+	// Other files in results/ are ignored.
+	if err := os.WriteFile(filepath.Join(dir, "20261004-120000-runs.json"), []byte(`[]`), 0o644); err != nil {
+		t.Fatal(err)
 	}
-	if tags.Operation != "tags" || tags.CompletedRPS != 1 {
-		t.Fatalf("tags summary: %+v", tags)
+	reports, err := loadReports(dir, "")
+	if err != nil || len(reports) != 4 {
+		t.Fatalf("reports=%d err=%v", len(reports), err)
 	}
-	for _, r := range rows {
-		if (r.Operation == "tags") != (r.EmptyReadRate == 0.2) {
-			t.Fatalf("empty read rate belongs to reads only: %+v", r)
-		}
+	profiles, steps := summarize(reports)
+	if len(profiles) != 2 || profiles[0].Profile != "pg_sync" || profiles[1].Profile != "kafka" {
+		t.Fatalf("profiles: %+v", profiles)
+	}
+	pg := profiles[0]
+	if pg.Runs != 3 || pg.FillRate != 300 || pg.DrainRate != 600 || pg.BytesPerMsg != 400 {
+		t.Fatalf("pg summary: %+v", pg)
+	}
+	if len(steps) != 4 || steps[0].Rate != 1000 || steps[0].Profile != "pg_sync" || steps[0].P99 != 3 {
+		t.Fatalf("steps: %+v", steps)
+	}
+	if s := steps[2]; s.Rate != 5000 || s.Saturated != 1 || s.Backlog != 9000 || s.Consumed != 4000 {
+		t.Fatalf("saturated step: %+v", s)
+	}
+	var out bytes.Buffer
+	if err := printTables(&out, profiles, steps); err != nil || !strings.Contains(out.String(), "kafka") {
+		t.Fatalf("table: %q %v", out.String(), err)
+	}
+	if err := writeCSV(filepath.Join(dir, "c.csv"), reports); err != nil {
+		t.Fatal(err)
+	}
+	csv, _ := os.ReadFile(filepath.Join(dir, "c.csv"))
+	if lines := strings.Count(string(csv), "\n"); lines != 1+4*4 {
+		t.Fatalf("csv has %d lines", lines)
 	}
 }
