@@ -1,4 +1,4 @@
-module pg-mongo-bench
+module github.com/Haleralex/pg-mongo-bench
 
 go 1.25.0
 

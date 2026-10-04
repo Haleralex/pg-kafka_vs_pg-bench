@@ -33,7 +33,7 @@ services:
       retries: 40
 
   api:
-    build: ./backend
+    build: .
     image: gotraining/docbench-api:local
     environment:
       BENCH_PROFILE: ${BENCH_PROFILE:-pg_gin_path_ops}
@@ -57,7 +57,8 @@ services:
     volumes:
       - ./k6:/scripts:ro
       - ./results:/results
-    entrypoint: [k6, run, /scripts/load.js]
+    # --quiet drops progress bars; the summary is still printed.
+    entrypoint: [k6, run, --quiet, /scripts/load.js]
 
 volumes:
   pg-data:

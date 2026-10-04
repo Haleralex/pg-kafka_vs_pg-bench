@@ -1,44 +1,58 @@
 # PostgreSQL JSONB / MongoDB event benchmark
 
-A local k6 benchmark of batched event ingestion while querying historical events.
+A k6 benchmark of batched event ingestion while querying historical events.
 The same Go HTTP service, generated documents, query windows and resource limits
-are used for both databases. This directory is a standalone Go module and Compose
-project; it does not use the training project's database containers.
+are used for both databases.
 
 ## Run
 
-Requires Docker Desktop running Linux containers and PowerShell. From GoTraining:
+Requires Docker with Linux containers and Go 1.25. The repository opens in
+GitHub Codespaces (`.devcontainer/` requests an 8-core machine with Docker, Go
+and make). Shared cloud vCPUs are noisy, so compare repeated runs.
 
-```powershell
-# Short integration check of all three default index configurations.
-.\lab\pg-mongo-bench\run.ps1 -SeedCount 3000 -RateSteps '10,30' -WarmupDuration 2s -StepDuration 5s -TransitionDuration 2s
-
-# Default mixed-load experiment, approximately 7 minutes plus seeding/building.
-.\lab\pg-mongo-bench\run.ps1
-
-# Repeat measurements, reversing profile order on alternate repetitions.
-.\lab\pg-mongo-bench\run.ps1 -Repetitions 3 -SkipBuild
-
-# Combine the saved measurements into results/comparison.csv.
-.\lab\pg-mongo-bench\summarize.ps1
-
-# Isolate writes or reads. Both commands reseed each profile.
-.\lab\pg-mongo-bench\run.ps1 -WritePercent 100 -SkipBuild
-.\lab\pg-mongo-bench\run.ps1 -WritePercent 0 -SkipBuild
-
-# Compare both general JSONB GIN operator classes.
-.\lab\pg-mongo-bench\run.ps1 -Profiles pg_gin_ops,pg_gin_path_ops,mongo_targeted -SkipBuild
+```bash
+make test      # vet and unit tests, no Docker
+make smoke     # ~2-minute end-to-end check of the three default profiles
+make bench     # full experiment, 3 passes, ~25 minutes plus seeding/building
+make summary   # results/comparison.csv and a median table
+make down      # remove containers and database volumes
 ```
 
-In GitHub Codespaces (`.devcontainer/` requests an 8-core machine with Docker,
-PowerShell and Go), run the same commands from the repository root with `pwsh`:
-`pwsh ./run.ps1 ...`. Shared cloud vCPUs are noisy; prefer `-Repetitions 3`.
+`make` passes `ARGS` to the runner; `go run ./cmd/bench run -h` lists all flags:
 
-The default API port is localhost:18088. Use `-Port 18089` if occupied. Databases
-are not published to the host. Containers stop after the experiment; use
-`-KeepRunning` to inspect the final profile interactively. Each seed operation
-recreates only `docbench.events_bench` in this dedicated Compose environment.
-Existing benchmark results have timestamped names and are retained.
+```bash
+# Isolate writes or reads. Both reseed each profile.
+make bench ARGS="-write-percent 100 -skip-build"
+make bench ARGS="-write-percent 0 -skip-build"
+
+# Compare both general JSONB GIN operator classes.
+make bench ARGS="-profiles pg_gin_ops,pg_gin_path_ops,mongo_targeted -skip-build"
+
+# Summarize one experiment only.
+make summary ARGS="-prefix 20261004-094116"
+```
+
+The API is published on 127.0.0.1:18088 (`-port` to change). Databases are not
+published to the host. Containers stop after the experiment; use `-keep-running`
+to inspect the final profile interactively. Each seed recreates only
+`docbench.events_bench` in this dedicated Compose project. Results have
+timestamped names and are retained.
+
+## Layout
+
+| Path | Responsibility |
+| --- | --- |
+| `cmd/api` | Configuration and wiring of the HTTP service for one profile |
+| `cmd/bench` | Orchestration: Compose lifecycle, seeding, cross-profile result check, k6, resource sampling, summaries |
+| `internal/event` | Deterministic event generator shared by seeding and writes |
+| `internal/store` | `Store` contract and `ReadQuery` |
+| `internal/store/postgres` | JSONB table and the `pg_*` index profiles with their predicates |
+| `internal/store/mongodb` | Collection and the `mongo_*` index profiles |
+| `internal/httpapi` | HTTP contract used by k6 and the runner |
+| `k6/load.js` | Arrival-rate load, per-phase/per-operation metrics and thresholds |
+
+A profile is data: its indexes and the query predicates that can use them live
+together, so adding a strategy means adding one entry to a profile list.
 
 ## Workload
 

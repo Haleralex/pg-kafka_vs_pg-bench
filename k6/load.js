@@ -111,6 +111,8 @@ phases.forEach((phase) => {
   activeOps.forEach((op) => {
     const opFilter = `${filter},op:${op}`;
     thresholds[`operations{${opFilter}}`] = ['count>=0'];
+    thresholds[`request_errors{${opFilter}}`] = ['rate>=0'];
+    if (op !== 'write') thresholds[`empty_read_rate{${opFilter}}`] = ['rate>=0'];
     thresholds[`http_req_duration{${opFilter}}`] = phase.kind === 'measurement'
       ? [`p(95)<${p95Limit}`] : ['p(95)>=0'];
     thresholds[`db_ms{${opFilter}}`] = ['p(95)>=0'];
