@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/Haleralex/pg-mongo-bench/internal/queue"
@@ -115,6 +116,9 @@ type runner struct {
 	t         *tracker
 	e2e       *samples
 	consumers []queue.Consumer
+	// workersFailed is set when a worker error stopped all workers, so nothing
+	// waits for a backlog that can no longer drain.
+	workersFailed atomic.Bool
 }
 
 func (r *runner) phases(ctx context.Context, res *Result) error {
@@ -308,6 +312,7 @@ func (r *runner) startConsumers(ctx context.Context, calls *samples) func() erro
 				}
 				if err != nil && errs[i] == nil {
 					errs[i] = err
+					r.workersFailed.Store(true)
 					cancel()
 				}
 			}
@@ -318,6 +323,9 @@ func (r *runner) startConsumers(ctx context.Context, calls *samples) func() erro
 					if errs[i] == nil {
 						errs[i] = fmt.Errorf("receive: %w", err)
 					}
+					// Every worker stops; say so now rather than after the drain timeout.
+					r.log("worker %d failed, stopping all workers: %v", i, err)
+					r.workersFailed.Store(true)
 					cancel()
 					return
 				}
@@ -346,7 +354,7 @@ func (r *runner) waitDrained(ctx context.Context, timeout time.Duration) (time.D
 	ticker := time.NewTicker(time.Millisecond)
 	defer ticker.Stop()
 	for r.t.backlog() > 0 {
-		if time.Since(start) > timeout {
+		if time.Since(start) > timeout || r.workersFailed.Load() {
 			return time.Since(start), false
 		}
 		select {

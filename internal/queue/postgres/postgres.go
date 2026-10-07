@@ -26,14 +26,21 @@ SELECT pg_stat_reset_shared('wal');`
 
 	// The inner SELECT skips rows other workers hold, so workers never wait on
 	// each other; ORDER BY id keeps the queue roughly FIFO.
+	//
+	// ARRAY(...) makes the claim an InitPlan that runs exactly once, followed by
+	// primary-key lookups. The common "WHERE id IN (SELECT ...)" form lets the
+	// planner turn it into a semi-join: once pgx's prepared statement switches to
+	// a generic plan, LIMIT $1 is estimated as 10% of the table, the join becomes
+	// a sequential scan of the whole (bloated) queue on every claim, and
+	// rechecks of concurrently deleted rows can re-run the locking subquery.
 	claimSQL = `
 DELETE FROM queue_jobs
-WHERE id IN (
+WHERE id = ANY(ARRAY(
 	SELECT id FROM queue_jobs
 	ORDER BY id
 	LIMIT $1
 	FOR UPDATE SKIP LOCKED
-)
+))
 RETURNING payload`
 
 	statsSQL = `
@@ -66,7 +73,12 @@ func New(ctx context.Context, cfg Config) (*Backend, error) {
 	}
 	poolCfg.MaxConns = cfg.MaxConns
 	poolCfg.MinConns = cfg.MaxConns
-	poolCfg.ConnConfig.RuntimeParams["synchronous_commit"] = cfg.SynchronousCommit
+	params := poolCfg.ConnConfig.RuntimeParams
+	params["synchronous_commit"] = cfg.SynchronousCommit
+	// Workers finish their claim even after a phase is cancelled; these turn a
+	// stuck statement or transaction into an error instead of a hung benchmark.
+	params["statement_timeout"] = "30s"
+	params["idle_in_transaction_session_timeout"] = "60s"
 	pool, err := pgxpool.NewWithConfig(ctx, poolCfg)
 	if err != nil {
 		return nil, err

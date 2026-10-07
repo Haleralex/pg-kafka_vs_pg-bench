@@ -2,6 +2,7 @@ package loadgen
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"reflect"
 	"slices"
@@ -20,6 +21,7 @@ type memory struct {
 	blocking  bool
 	redeliver bool // hand every 10th batch out twice
 	drop      bool // lose the first message
+	failAt    int  // Receive fails once this many sends happened; 0 never
 	sends     int
 }
 
@@ -51,6 +53,10 @@ func (c memConsumer) Receive(ctx context.Context, limit int, handle func([]byte)
 	m := c.m
 	for {
 		m.mu.Lock()
+		if m.failAt > 0 && m.sends >= m.failAt {
+			m.mu.Unlock()
+			return 0, errors.New("broker gone")
+		}
 		n := min(limit, len(m.items))
 		batch := slices.Clone(m.items[:n])
 		if !(m.redeliver && m.sends%10 == 0) {
@@ -173,5 +179,19 @@ func TestArgsRoundTrip(t *testing.T) {
 	}
 	if err := fs.Parse([]string{"-rates", "100,,200"}); err == nil {
 		t.Fatal("bad rates accepted")
+	}
+}
+
+func TestWorkerFailureEndsTheRunWithoutWaitingForDrain(t *testing.T) {
+	cfg := testConfig()
+	cfg.DrainTimeout = time.Minute
+	started := time.Now()
+	// Fails during fill: drain must not wait a minute for workers that are gone.
+	_, err := Run(t.Context(), &memory{failAt: 50}, cfg, t.Logf)
+	if err == nil || !strings.Contains(err.Error(), "broker gone") {
+		t.Fatalf("error not reported: %v", err)
+	}
+	if elapsed := time.Since(started); elapsed > 10*time.Second {
+		t.Fatalf("run took %s after the workers failed", elapsed)
 	}
 }
