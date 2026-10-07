@@ -86,10 +86,15 @@ func runCommand(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
+	// The loadgen container writes its report into the same directory. Compose
+	// reads a bare name such as "results" as a named volume, so pass a path.
+	resultDir, err := filepath.Abs(cfg.resultDir)
+	if err != nil {
+		return err
+	}
 	r := &runner{
-		cfg: cfg,
-		// The loadgen container writes its report into the same directory.
-		compose: compose{file: cfg.composeFile, env: []string{"RESULTS_DIR=" + cfg.resultDir}},
+		cfg:     cfg,
+		compose: compose{file: cfg.composeFile, env: []string{"RESULTS_DIR=" + resultDir}},
 		stamp:   time.Now().UTC().Format("20060102-150405"),
 	}
 	defer r.stopServices()
