@@ -2,6 +2,7 @@
 //
 //	bench run [flags]        start each broker in Docker Compose and run cmd/loadgen against it
 //	bench summarize [flags]  combine loadgen reports into a CSV and median tables
+//	bench report [flags]     write results/report.html with charts and optionally serve it
 package main
 
 import (
@@ -23,6 +24,8 @@ func main() {
 		err = runCommand(ctx, os.Args[2:])
 	case "summarize":
 		err = summarizeCommand(os.Args[2:])
+	case "report":
+		err = reportCommand(ctx, os.Args[2:])
 	default:
 		usage()
 	}
@@ -34,6 +37,6 @@ func main() {
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "usage: bench run|summarize [flags]; use -h after a command for its flags")
+	fmt.Fprintln(os.Stderr, "usage: bench run|summarize|report [flags]; use -h after a command for its flags")
 	os.Exit(2)
 }

@@ -26,7 +26,8 @@ make test      # vet and unit tests, no Docker
 make smoke     # few-minute end-to-end check of every profile
 make bench     # full experiment, 3 passes, ~45 minutes plus image pulls
 make summary   # results/comparison.csv and median tables
-make down      # remove containers and volumes
+make report    # results/report.html with charts, served on port 8090
+make down      # remove containers, volumes and the Prometheus history
 ```
 
 `make` passes `ARGS` to the runner; `go run ./cmd/bench run -h` lists all flags:
@@ -36,11 +37,39 @@ make bench ARGS="-profiles pg_sync,kafka_fsync -skip-build"
 make bench ARGS="-consumers 16 -producers 8"        # Kafka gets 16 partitions
 make bench ARGS="-payload 4096 -rates 1000,5000"
 make bench ARGS="-kafka-linger 10ms"                # franz-go's default batching
-make summary ARGS="-prefix 20261004-094116"
+make summary ARGS="-prefix 20261004-094116"   # default: the latest experiment
+make bench ARGS="-monitor=false"               # without Prometheus and Grafana
 ```
 
-Each profile starts from empty volumes, and only its broker runs. Results have
-timestamped names and are retained.
+Each profile starts from empty broker storage, and only its broker runs.
+Results have timestamped names and are retained.
+
+## Watching
+
+**Live.** `make bench` and `make smoke` start Prometheus and Grafana and print
+the dashboard address. In Codespaces open the forwarded port 3000 (the
+*Ports* tab, or the printed `https://<codespace>-3000.app.github.dev` link); no
+login. The dashboard refreshes every 2 seconds and shows:
+
+| Panel | Source | What to look for |
+| --- | --- | --- |
+| profile, phase, target rate | loadgen | where the run is |
+| sent / consumed / target per second | loadgen | consumed below target: saturation |
+| backlog | loadgen | growing backlog: workers fall behind |
+| e2e p50/p99, send/receive p99 | loadgen histograms | latency jumps at saturation |
+| CPU and memory per container | `docker stats` via cmd/bench | loadgen near 400% means the generator, not the broker, is the limit |
+| live/dead tuples, autovacuum, WAL/s | PostgreSQL statistics | dead tuples after drain slow down claims |
+| lag and log size per partition | Kafka admin API | uneven lag: partition skew |
+
+Grafana keeps running after the experiment with its history (7 days);
+`make monitor` starts it again later, `make down` removes it. Histogram
+percentiles in Grafana are rounded to buckets; the report has exact values.
+
+**After the run.** `make report` writes `results/report.html` for the latest
+experiment and serves it on port 8090: e2e latency against rate per profile,
+throughput against target, fill/drain, bytes on disk per message, the
+durability pairs side by side, CPU timelines and the median tables. Add
+`ARGS="-prefix <stamp>"` for an older experiment.
 
 ## What is measured
 
@@ -97,3 +126,6 @@ PostgreSQL's idle-poll delay at low rates.
 | `internal/queue/postgres` | Table queue with `SKIP LOCKED` |
 | `internal/queue/kafka` | Topic and consumer group via franz-go |
 | `internal/profile` | Profile list and which compose service each needs |
+| `internal/metrics` | Prometheus metrics of loadgen and of container stats |
+| `monitoring/` | Prometheus scrape config, Grafana data source and dashboard |
+| `cmd/bench/report.html.tmpl` | Charts of `make report` (Chart.js) |

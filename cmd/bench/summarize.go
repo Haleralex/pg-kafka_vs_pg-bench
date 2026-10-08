@@ -20,7 +20,7 @@ import (
 )
 
 // runIDPattern splits IDs created by runProfile: <stamp>-r<repetition>-<profile>.
-var runIDPattern = regexp.MustCompile(`^.+-r(\d+)-(.+)$`)
+var runIDPattern = regexp.MustCompile(`^(.+)-r(\d+)-(.+)$`)
 
 // report is the subset of cmd/loadgen's Report used here.
 type report struct {
@@ -29,6 +29,7 @@ type report struct {
 	Result       loadgen.Result `json:"result"`
 	BackendStats map[string]any `json:"backend_stats"`
 	Error        string         `json:"error"`
+	stamp        string         // experiment the run belongs to
 	repetition   int
 }
 
@@ -48,13 +49,30 @@ func loadReports(dir, prefix string) ([]report, error) {
 			return nil, fmt.Errorf("%s: %w", file, err)
 		}
 		match := runIDPattern.FindStringSubmatch(rep.RunID)
-		if match == nil || match[2] != rep.Profile {
+		if match == nil || match[3] != rep.Profile {
 			return nil, fmt.Errorf("%s: unexpected run_id %q for profile %q", file, rep.RunID, rep.Profile)
 		}
-		rep.repetition, _ = strconv.Atoi(match[1])
+		rep.stamp = match[1]
+		rep.repetition, _ = strconv.Atoi(match[2])
 		reports = append(reports, rep)
 	}
 	return reports, nil
+}
+
+// latestExperiment keeps the runs of the newest `bench run`; smoke runs and
+// aborted experiments would otherwise mix into the medians.
+func latestExperiment(reports []report) []report {
+	latest := ""
+	for _, r := range reports {
+		latest = max(latest, r.stamp)
+	}
+	return slices.DeleteFunc(reports, func(r report) bool { return r.stamp != latest })
+}
+
+// saturated reports a step the queue did not keep up with: workers consumed
+// noticeably less than scheduled, or the backlog outlived the drain timeout.
+func saturated(s loadgen.Step) bool {
+	return s.ConsumedRate < 0.95*float64(s.TargetRate) || !s.Drained
 }
 
 // storedBytesPerMessage is what the broker wrote per produced message: WAL for
@@ -123,7 +141,7 @@ func summarize(reports []report) ([]profileSummary, []stepSummary) {
 			ss.P999 = median(group, func(s loadgen.Step) float64 { return s.EndToEnd.P999 })
 			ss.Backlog = median(group, func(s loadgen.Step) float64 { return float64(s.BacklogAtEnd) })
 			for _, s := range group {
-				if !s.Drained {
+				if saturated(s) {
 					ss.Saturated++
 				}
 			}
@@ -157,7 +175,8 @@ func median[T any](items []T, value func(T) float64) float64 {
 func summarizeCommand(args []string) error {
 	fs := flag.NewFlagSet("summarize", flag.ContinueOnError)
 	dir := fs.String("results", "results", "directory with loadgen reports")
-	prefix := fs.String("prefix", "", "only runs whose ID starts with this, e.g. a run timestamp")
+	prefix := fs.String("prefix", "", "only runs whose ID starts with this, e.g. a run timestamp; default: the latest experiment")
+	all := fs.Bool("all", false, "every report in the directory, from all experiments")
 	out := fs.String("out", "comparison.csv", "CSV file name inside the results directory")
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
@@ -171,6 +190,10 @@ func summarizeCommand(args []string) error {
 	}
 	if len(reports) == 0 {
 		return fmt.Errorf("no reports in %s matching %q", *dir, *prefix+"*-report.json")
+	}
+	if *prefix == "" && !*all {
+		reports = latestExperiment(reports)
+		fmt.Printf("Experiment %s (-all for every run, -prefix to pick one)\n", reports[0].stamp)
 	}
 	csvPath := filepath.Join(*dir, *out)
 	if err := writeCSV(csvPath, reports); err != nil {

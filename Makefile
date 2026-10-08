@@ -1,6 +1,6 @@
 BENCH := go run ./cmd/bench
 
-.PHONY: test smoke bench summary down
+.PHONY: test smoke bench summary report monitor down
 
 ## test: static checks and unit tests; no Docker required
 test:
@@ -19,6 +19,14 @@ bench:
 summary:
 	$(BENCH) summarize $(ARGS)
 
+## report: results/report.html with charts, served on port 8090 (Ctrl+C stops)
+report:
+	$(BENCH) report -serve :8090 $(ARGS)
+
+## monitor: start Prometheus and Grafana alone, e.g. to look at a past run
+monitor:
+	docker compose --profile monitor up -d --wait prometheus grafana
+
 ## down: remove the benchmark containers and their volumes
 down:
-	docker compose --profile load down -v --remove-orphans
+	docker compose --profile load --profile monitor down -v --remove-orphans

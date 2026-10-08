@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/Haleralex/pg-mongo-bench/internal/loadgen"
+	"github.com/Haleralex/pg-mongo-bench/internal/metrics"
 	"github.com/Haleralex/pg-mongo-bench/internal/profile"
 )
 
@@ -25,6 +26,7 @@ type runConfig struct {
 	repetitions int
 	skipBuild   bool
 	keepRunning bool
+	monitor     bool
 	resultDir   string
 	composeFile string
 }
@@ -39,6 +41,7 @@ func parseRunFlags(args []string) (runConfig, error) {
 	fs.IntVar(&cfg.repetitions, "repetitions", 1, "full passes over the profiles; even passes run in reverse order")
 	fs.BoolVar(&cfg.skipBuild, "skip-build", false, "reuse the existing loadgen image")
 	fs.BoolVar(&cfg.keepRunning, "keep-running", false, "leave the last profile's broker running")
+	fs.BoolVar(&cfg.monitor, "monitor", true, "start Prometheus and Grafana (port 3000) and publish container stats")
 	fs.StringVar(&cfg.resultDir, "results", "results", "directory for measurements")
 	fs.StringVar(&cfg.composeFile, "compose", "compose.yaml", "Compose file")
 	if err := fs.Parse(args); err != nil {
@@ -72,10 +75,11 @@ type runRecord struct {
 }
 
 type runner struct {
-	cfg     runConfig
-	compose compose
-	stamp   string
-	records []runRecord
+	cfg        runConfig
+	compose    compose
+	stamp      string
+	records    []runRecord
+	containers *metrics.Containers // nil without -monitor
 }
 
 func runCommand(ctx context.Context, args []string) error {
@@ -123,6 +127,11 @@ func (r *runner) run(ctx context.Context) error {
 	if err := r.compose.run(ctx, nil, "pull", "postgres", "kafka"); err != nil {
 		return err
 	}
+	if r.cfg.monitor {
+		if err := r.startMonitoring(ctx); err != nil {
+			return err
+		}
+	}
 	if err := r.saveImages(ctx); err != nil {
 		return err
 	}
@@ -159,9 +168,10 @@ func (r *runner) runProfile(ctx context.Context, repetition int, name string) er
 	id := fmt.Sprintf("%s-r%d-%s", r.stamp, repetition, name)
 	fmt.Printf("\n== %s: %s\n", id, p.Description)
 
-	// Every profile starts from empty volumes, and only one broker runs at a time
-	// so that both get the same host resources.
-	if err := r.compose.run(ctx, nil, "--profile", "load", "down", "-v", "--remove-orphans"); err != nil {
+	// Every profile starts from empty storage (brokers use anonymous volumes,
+	// which rm --volumes deletes), and only one broker runs at a time so that
+	// both get the same host resources. Monitoring keeps running across profiles.
+	if err := r.removeBrokers(ctx); err != nil {
 		return err
 	}
 	if err := r.compose.run(ctx, nil, "up", "-d", "--wait", p.Service); err != nil {
@@ -174,7 +184,8 @@ func (r *runner) runProfile(ctx context.Context, repetition int, name string) er
 	}
 	defer log.Close()
 	container := "queuebench-loadgen-" + id
-	args := []string{"--profile", "load", "run", "--rm", "--no-deps", "-T", "--name", container, "loadgen",
+	// --use-aliases makes the container reachable as "loadgen" for Prometheus.
+	args := []string{"--profile", "load", "run", "--rm", "--no-deps", "-T", "--use-aliases", "--name", container, "loadgen",
 		"-profile", name, "-run-id", id, "-out", "/results/" + id + "-report.json", "-kafka-linger", r.cfg.kafkaLinger.String()}
 	cmd := r.compose.command(ctx, nil, append(args, r.cfg.workload.Args()...)...)
 	cmd.Stdout = io.MultiWriter(os.Stdout, log)
@@ -182,7 +193,11 @@ func (r *runner) runProfile(ctx context.Context, repetition int, name string) er
 
 	sampleCtx, stopSampling := context.WithCancel(ctx)
 	samples := make(chan []resourceSample, 1)
-	go func() { samples <- sampleResources(sampleCtx, 2*time.Second) }()
+	var publish func([]metrics.ContainerSample)
+	if r.containers != nil {
+		publish = r.containers.Set
+	}
+	go func() { samples <- sampleResources(sampleCtx, 2*time.Second, publish) }()
 	runErr := cmd.Run()
 	stopSampling()
 	resources := <-samples
@@ -215,9 +230,45 @@ func (r *runner) stopServices() {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
-	if err := r.compose.run(ctx, nil, "--profile", "load", "down", "-v", "--remove-orphans"); err != nil {
+	if err := r.removeBrokers(ctx); err != nil {
 		fmt.Fprintln(os.Stderr, "bench: cleanup:", err)
 	}
+	if r.cfg.monitor {
+		fmt.Println("Grafana keeps the history of this run:", grafanaURL(), "- make down removes it")
+	}
+}
+
+func (r *runner) removeBrokers(ctx context.Context) error {
+	return r.compose.run(ctx, nil, "rm", "--stop", "--force", "--volumes", "postgres", "kafka")
+}
+
+// containerMetricsAddr must match the "containers" job in monitoring/prometheus.yml.
+const containerMetricsAddr = ":9101"
+
+// startMonitoring starts Prometheus and Grafana and publishes container stats
+// on the host for Prometheus, which reaches it as host.docker.internal.
+func (r *runner) startMonitoring(ctx context.Context) error {
+	if err := r.compose.run(ctx, nil, "--profile", "monitor", "up", "-d", "--wait", "prometheus", "grafana"); err != nil {
+		return err
+	}
+	r.containers = metrics.NewContainers()
+	if err := metrics.Serve(ctx, containerMetricsAddr, r.containers.Handler()); err != nil {
+		return fmt.Errorf("publish container stats: %w", err)
+	}
+	fmt.Println("Live dashboard:", grafanaURL())
+	return nil
+}
+
+func grafanaURL() string { return forwardedURL(":3000") }
+
+// forwardedURL is the browser address of a local port: the forwarded one in
+// GitHub Codespaces, localhost elsewhere.
+func forwardedURL(addr string) string {
+	port := addr[strings.LastIndex(addr, ":")+1:]
+	if name, domain := os.Getenv("CODESPACE_NAME"), os.Getenv("GITHUB_CODESPACES_PORT_FORWARDING_DOMAIN"); name != "" && domain != "" {
+		return fmt.Sprintf("https://%s-%s.%s", name, port, domain)
+	}
+	return "http://localhost:" + port
 }
 
 func (r *runner) path(name string) string { return filepath.Join(r.cfg.resultDir, name) }

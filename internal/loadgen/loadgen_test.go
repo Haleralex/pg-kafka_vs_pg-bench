@@ -92,7 +92,7 @@ func testConfig() Config {
 func TestRunAccountsForEveryMessage(t *testing.T) {
 	for _, blocking := range []bool{false, true} {
 		cfg := testConfig()
-		res, err := Run(t.Context(), &memory{blocking: blocking}, cfg, t.Logf)
+		res, err := Run(t.Context(), &memory{blocking: blocking}, cfg, nil, t.Logf)
 		if err != nil {
 			t.Fatalf("blocking=%v: %v", blocking, err)
 		}
@@ -118,13 +118,13 @@ func TestRunAccountsForEveryMessage(t *testing.T) {
 }
 
 func TestRunCountsDuplicatesAndLoss(t *testing.T) {
-	res, err := Run(t.Context(), &memory{redeliver: true}, testConfig(), t.Logf)
+	res, err := Run(t.Context(), &memory{redeliver: true}, testConfig(), nil, t.Logf)
 	if err != nil || res.Duplicates == 0 {
 		t.Fatalf("redelivery: duplicates=%d err=%v", res.Duplicates, err)
 	}
 	cfg := testConfig()
 	cfg.DrainTimeout = 200 * time.Millisecond
-	_, err = Run(t.Context(), &memory{drop: true}, cfg, t.Logf)
+	_, err = Run(t.Context(), &memory{drop: true}, cfg, nil, t.Logf)
 	if err == nil || !strings.Contains(err.Error(), "prime") {
 		t.Fatalf("loss not reported: %v", err)
 	}
@@ -187,7 +187,7 @@ func TestWorkerFailureEndsTheRunWithoutWaitingForDrain(t *testing.T) {
 	cfg.DrainTimeout = time.Minute
 	started := time.Now()
 	// Fails during fill: drain must not wait a minute for workers that are gone.
-	_, err := Run(t.Context(), &memory{failAt: 50}, cfg, t.Logf)
+	_, err := Run(t.Context(), &memory{failAt: 50}, cfg, nil, t.Logf)
 	if err == nil || !strings.Contains(err.Error(), "broker gone") {
 		t.Fatalf("error not reported: %v", err)
 	}

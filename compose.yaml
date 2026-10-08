@@ -1,7 +1,10 @@
 name: gotraining-queuebench
 
-# One broker runs at a time (cmd/bench stops the other), each with the same
-# CPU and memory limits. Nothing is published to the host.
+# One broker runs at a time (cmd/bench removes the other), each with the same
+# CPU and memory limits. Brokers keep data in anonymous volumes, which
+# `docker compose rm --volumes` deletes, so every profile starts empty while
+# Prometheus keeps its history. Only Grafana (3000) and Prometheus (9090) are
+# published to the host.
 services:
   postgres:
     image: postgres:17
@@ -15,7 +18,7 @@ services:
     mem_limit: 2g
     shm_size: 768m
     volumes:
-      - pg-data:/var/lib/postgresql/data
+      - /var/lib/postgresql/data
     healthcheck:
       test: [CMD-SHELL, pg_isready -U queuebench -d queuebench]
       interval: 2s
@@ -44,7 +47,7 @@ services:
     cpus: 2
     mem_limit: 2g
     volumes:
-      - kafka-data:/var/lib/kafka/data
+      - /var/lib/kafka/data
     healthcheck:
       test: [CMD-SHELL, /opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 >/dev/null]
       interval: 5s
@@ -63,9 +66,54 @@ services:
       GOMAXPROCS: "4"
     cpus: 4
     mem_limit: 1g
+    expose: ["9100"]
     volumes:
       - ${RESULTS_DIR:-./results}:/results
 
+  prometheus:
+    image: prom/prometheus:v3.5.0
+    profiles: [monitor]
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.retention.time=7d
+    # cmd/bench publishes docker stats on the host; this name reaches it.
+    extra_hosts: ["host.docker.internal:host-gateway"]
+    cpus: 0.5
+    mem_limit: 512m
+    ports: ["127.0.0.1:9090:9090"]
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    healthcheck:
+      test: [CMD, wget, -q, -O, /dev/null, http://localhost:9090/-/ready]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  grafana:
+    image: grafana/grafana:12.1.1
+    profiles: [monitor]
+    environment:
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Admin
+      GF_AUTH_DISABLE_LOGIN_FORM: "true"
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /var/lib/grafana/dashboards/queuebench.json
+      # Codespaces forwards the port under another host name; Grafana rejects
+      # requests whose Origin it does not trust.
+      GF_SECURITY_CSRF_TRUSTED_ORIGINS: ${CODESPACE_NAME:-localhost}-3000.${GITHUB_CODESPACES_PORT_FORWARDING_DOMAIN:-localhost}
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+    cpus: 0.5
+    mem_limit: 512m
+    ports: ["127.0.0.1:3000:3000"]
+    volumes:
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./monitoring/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    healthcheck:
+      test: [CMD, wget, -q, -O, /dev/null, http://localhost:3000/api/health]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+
 volumes:
-  pg-data:
-  kafka-data:
+  prometheus-data:

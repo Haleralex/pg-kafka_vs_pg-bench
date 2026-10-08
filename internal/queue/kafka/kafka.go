@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"strconv"
+	"sync/atomic"
 	"time"
 
 	"github.com/twmb/franz-go/pkg/kadm"
@@ -29,7 +30,8 @@ type Backend struct {
 	cfg      Config
 	admin    *kadm.Client
 	producer *kgo.Client
-	topic    string
+	// topic is set by Reset and read by Stats, which monitoring calls concurrently.
+	topic atomic.Pointer[string]
 }
 
 func New(ctx context.Context, cfg Config) (*Backend, error) {
@@ -48,24 +50,25 @@ func New(ctx context.Context, cfg Config) (*Backend, error) {
 // Reset creates a fresh topic and consumer group instead of deleting the old
 // ones: topic deletion in Kafka is asynchronous.
 func (b *Backend) Reset(ctx context.Context, consumers int) error {
-	b.topic = "queue-" + strconv.FormatInt(time.Now().UnixNano(), 36)
+	topic := "queue-" + strconv.FormatInt(time.Now().UnixNano(), 36)
 	configs := map[string]*string{}
 	if b.cfg.Fsync {
 		configs["flush.messages"] = kadm.StringPtr("1")
 	}
-	resp, err := b.admin.CreateTopic(ctx, int32(consumers), 1, configs, b.topic)
+	resp, err := b.admin.CreateTopic(ctx, int32(consumers), 1, configs, topic)
 	if err == nil {
 		err = resp.Err
 	}
 	if err != nil {
-		return fmt.Errorf("create topic %s: %w", b.topic, err)
+		return fmt.Errorf("create topic %s: %w", topic, err)
 	}
+	b.topic.Store(&topic)
 	if b.producer != nil {
 		b.producer.Close()
 	}
 	b.producer, err = kgo.NewClient(
 		kgo.SeedBrokers(b.cfg.Brokers...),
-		kgo.DefaultProduceTopic(b.topic),
+		kgo.DefaultProduceTopic(topic),
 		kgo.RequiredAcks(kgo.AllISRAcks()),
 		kgo.ProducerLinger(b.cfg.Linger),
 		// Payloads are random; compression would only cost CPU.
@@ -88,8 +91,8 @@ func (b *Backend) Send(ctx context.Context, payloads [][]byte) error {
 func (b *Backend) NewConsumer(context.Context) (queue.Consumer, error) {
 	cl, err := kgo.NewClient(
 		kgo.SeedBrokers(b.cfg.Brokers...),
-		kgo.ConsumeTopics(b.topic),
-		kgo.ConsumerGroup(b.topic),
+		kgo.ConsumeTopics(*b.topic.Load()),
+		kgo.ConsumerGroup(*b.topic.Load()),
 		kgo.DisableAutoCommit(),
 		// Partitions are not reassigned between poll and commit, which would
 		// hand already processed records to another worker.
@@ -103,16 +106,42 @@ func (b *Backend) NewConsumer(context.Context) (queue.Consumer, error) {
 
 func (b *Backend) Blocking() bool { return true }
 
+// Stats reports the topic's log size and the group's lag, in total and per
+// partition, so that skew between partitions is visible.
 func (b *Backend) Stats(ctx context.Context) (map[string]any, error) {
-	dirs, err := b.admin.DescribeAllLogDirs(ctx, kadm.TopicsSet{b.topic: nil})
+	topic := b.topic.Load()
+	if topic == nil {
+		return nil, errors.New("kafka stats: no topic before Reset")
+	}
+	// A TopicsSet entry with no partitions selects none; nil describes everything.
+	dirs, err := b.admin.DescribeAllLogDirs(ctx, nil)
 	if err != nil {
 		return nil, fmt.Errorf("kafka stats: %w", err)
 	}
+	stats := map[string]any{"topic": *topic, "flush_messages_1": b.cfg.Fsync}
 	var size int64
 	for _, broker := range dirs {
-		size += broker.Size()
+		broker.EachPartition(func(p kadm.DescribedLogDirPartition) {
+			if p.Topic == *topic {
+				size += p.Size
+				stats[fmt.Sprintf("partition_%d_log_bytes", p.Partition)] = p.Size
+			}
+		})
 	}
-	return map[string]any{"topic": b.topic, "log_bytes": size, "flush_messages_1": b.cfg.Fsync}, nil
+	stats["log_bytes"] = size
+	// The group is named after the topic; before workers join it has no lag.
+	lags, err := b.admin.Lag(ctx, *topic)
+	if err == nil {
+		var total int64
+		for _, l := range lags[*topic].Lag[*topic] {
+			if l.Err == nil && l.Lag >= 0 {
+				total += l.Lag
+				stats[fmt.Sprintf("partition_%d_lag", l.Partition)] = l.Lag
+			}
+		}
+		stats["lag"] = total
+	}
+	return stats, nil
 }
 
 func (b *Backend) Close() {

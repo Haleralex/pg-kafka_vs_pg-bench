@@ -73,11 +73,34 @@ type Result struct {
 // not dominate latency there; at high rates the batch reaches Config.Batch.
 const steadyBatchesPerSecond = 200
 
-func Run(ctx context.Context, b queue.Backend, cfg Config, log func(string, ...any)) (Result, error) {
+// Observer receives live events for monitoring; Run calls it from many
+// goroutines and on the hot path, so implementations must be cheap and safe.
+type Observer interface {
+	Phase(name string, targetRate int)
+	Sent(messages int, took time.Duration)
+	Received(messages int, took time.Duration)
+	Consumed(endToEnd time.Duration)
+	Duplicate()
+}
+
+type nopObserver struct{}
+
+func (nopObserver) Phase(string, int)           {}
+func (nopObserver) Sent(int, time.Duration)     {}
+func (nopObserver) Received(int, time.Duration) {}
+func (nopObserver) Consumed(time.Duration)      {}
+func (nopObserver) Duplicate()                  {}
+
+// Run executes every phase; obs may be nil.
+func Run(ctx context.Context, b queue.Backend, cfg Config, obs Observer, log func(string, ...any)) (Result, error) {
+	if obs == nil {
+		obs = nopObserver{}
+	}
 	if err := b.Reset(ctx, cfg.Consumers); err != nil {
 		return Result{}, err
 	}
-	r := &runner{b: b, cfg: cfg, log: log, t: newTracker(capacity(cfg)), e2e: newSamples(cfg.Consumers)}
+	r := &runner{b: b, cfg: cfg, obs: obs, log: log, t: newTracker(capacity(cfg)), e2e: newSamples(cfg.Consumers)}
+	defer obs.Phase("done", 0)
 	for range cfg.Consumers {
 		c, err := b.NewConsumer(ctx)
 		if err != nil {
@@ -112,6 +135,7 @@ func primeMessages(cfg Config) int { return 2 * cfg.Consumers * cfg.Batch }
 type runner struct {
 	b         queue.Backend
 	cfg       Config
+	obs       Observer
 	log       func(string, ...any)
 	t         *tracker
 	e2e       *samples
@@ -122,6 +146,7 @@ type runner struct {
 }
 
 func (r *runner) phases(ctx context.Context, res *Result) error {
+	r.obs.Phase("prime", 0)
 	r.log("prime: %d messages through %d workers", primeMessages(r.cfg), r.cfg.Consumers)
 	stop := r.startConsumers(ctx, nil)
 	if _, err := r.produceClosed(ctx, uint64(primeMessages(r.cfg))); err != nil {
@@ -135,6 +160,7 @@ func (r *runner) phases(ctx context.Context, res *Result) error {
 		return fmt.Errorf("prime: workers did not receive the priming messages within %s", r.cfg.DrainTimeout)
 	}
 
+	r.obs.Phase("fill", 0)
 	r.log("fill: %d messages, %d producers, batch %d", r.cfg.Backlog, r.cfg.Producers, r.cfg.Batch)
 	var err error
 	if res.Fill, err = r.produceClosed(ctx, r.t.next.Load()+uint64(r.cfg.Backlog)); err != nil {
@@ -142,6 +168,7 @@ func (r *runner) phases(ctx context.Context, res *Result) error {
 	}
 	r.log("fill: %.0f msg/s", res.Fill.PerSecond)
 
+	r.obs.Phase("drain", 0)
 	r.log("drain: %d workers", r.cfg.Consumers)
 	if res.Drain, err = r.drain(ctx); err != nil {
 		return err
@@ -201,9 +228,11 @@ func (r *runner) send(ctx context.Context, first uint64, n int, scheduled time.T
 	for i := range payloads {
 		payloads[i] = queue.Encode(first+uint64(i), scheduled, r.cfg.Payload)
 	}
+	started := time.Now()
 	if err := r.b.Producer().Send(ctx, payloads); err != nil {
 		return fmt.Errorf("send: %w", err)
 	}
+	r.obs.Sent(n, time.Since(started))
 	r.t.acked.Add(int64(n))
 	return nil
 }
@@ -234,6 +263,7 @@ func (r *runner) steady(ctx context.Context, rate int) (Step, error) {
 	measureFrom := start.Add(r.cfg.StepWarmup)
 	end := measureFrom.Add(r.cfg.Step)
 	lag := newSamples(r.cfg.Producers)
+	r.obs.Phase("steady", rate)
 
 	r.e2e.take()
 	var producedAt, consumedAt [2]int64
@@ -279,6 +309,8 @@ func (r *runner) steady(ctx context.Context, rate int) (Step, error) {
 	if err != nil {
 		return Step{}, err
 	}
+	// Producers stopped; workers work off what the step left behind.
+	r.obs.Phase("catch_up", rate)
 	seconds := r.cfg.Step.Seconds()
 	step := Step{
 		TargetRate: rate, SendBatch: batch,
@@ -307,7 +339,11 @@ func (r *runner) startConsumers(ctx context.Context, calls *samples) func() erro
 				if err == nil {
 					var duplicate bool
 					if duplicate, err = r.t.mark(seq); err == nil && !duplicate {
-						r.e2e.add(i, time.Since(scheduled))
+						e2e := time.Since(scheduled)
+						r.e2e.add(i, e2e)
+						r.obs.Consumed(e2e)
+					} else if duplicate {
+						r.obs.Duplicate()
 					}
 				}
 				if err != nil && errs[i] == nil {
@@ -329,8 +365,12 @@ func (r *runner) startConsumers(ctx context.Context, calls *samples) func() erro
 					cancel()
 					return
 				}
-				if n > 0 && calls != nil {
-					calls.add(i, time.Since(started))
+				if n > 0 {
+					took := time.Since(started)
+					r.obs.Received(n, took)
+					if calls != nil {
+						calls.add(i, took)
+					}
 				}
 				if n == 0 && !r.b.Blocking() {
 					select {
